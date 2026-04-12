@@ -206,10 +206,23 @@ class SentenceTransformer:
 class EmbeddingCache:
     """Persistent SQLite cache for embeddings."""
     
-    def __init__(self, cache_dir: str = "index/cache"):
+    def __init__(
+        self,
+        cache_dir: str = "index/cache",
+        ttl_days: Optional[int] = 30,
+        max_rows: Optional[int] = 200_000,
+        prune_every_writes: int = 500,
+    ):
         self.db_path = Path(cache_dir) / "embeddings.db"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        self.ttl_days = ttl_days
+        self.max_rows = max_rows
+        self.prune_every_writes = max(1, prune_every_writes)
+        self._writes_since_prune = 0
+
         self._init_db()
+        self.prune()
     
     def _init_db(self):
         """Initialize database schema."""
@@ -225,6 +238,7 @@ class EmbeddingCache:
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_model_name ON embeddings(model_name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON embeddings(timestamp)")
     
     def get(self, model_path: str, query: str) -> Optional[np.ndarray]:
         """Retrieve cached embedding if it exists."""
@@ -239,7 +253,7 @@ class EmbeddingCache:
             if row:
                 return np.frombuffer(row[0], dtype=np.float32)
         return None
-    
+
     def set(self, model_path: str, query: str, embedding: np.ndarray):
         """Store embedding in cache."""
         model_name = Path(model_path).stem
@@ -251,6 +265,36 @@ class EmbeddingCache:
                 "INSERT OR REPLACE INTO embeddings (model_name, model_hash, query_text, embedding) VALUES (?,?,?,?)",
                 (model_name, model_hash, query, blob)
             )
+        self._prune_if_needed()
+
+    def prune(self):
+        """Retention policy: TTL + max row cap"""
+        with sqlite3.connect(self.db_path) as conn:
+            if self.ttl_days is not None:
+                conn.execute(
+                    "DELETE FROM embeddings WHERE timestamp < datetime('now', ?)",
+                    (f"-{int(self.ttl_days)} days",),
+                )
+            
+            if self.max_rows is not None:
+                conn.execute(
+                    """
+                    DELETE FROM embeddings
+                    WHERE rowid IN (
+                        SELECT rowid
+                        FROM embeddings
+                        ORDER BY timestamp DESC
+                        LIMIT -1 OFFSET ?
+                    )
+                    """,
+                    (int(self.max_rows),),
+                )
+    
+    def _prune_if_needed(self):
+        self._writes_since_prune += 1
+        if self._writes_since_prune >= self.prune_every_writes:
+            self.prune()
+            self._writes_since_prune = 0
 
 
 class CachedEmbedder:
