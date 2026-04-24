@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Optional
 
 import yaml
 import pathlib
@@ -57,11 +57,19 @@ class RAGConfig:
     # user feedback modeling
     enable_topic_extraction: bool = False
 
+    # embedding cache retention policy
+    cache_dir: str = "index/cache"
+    cache_ttl_days: Optional[int] = 30
+    cache_max_rows: Optional[int] = 200_000
+    cache_prune_every_writes: int = 500
+    cache_strict_ttl_on_read: bool = False
+    cache_eviction_policy: str = "fifo"
+
     # ---------- factory + validation ----------
     @classmethod
     def from_yaml(cls, path: os.PathLike) -> RAGConfig:
         with open(path, 'r') as f:
-            data = yaml.safe_load(open(path))
+            data = yaml.safe_load(f)
         return cls(**data)
     
     def __post_init__(self):
@@ -72,6 +80,9 @@ class RAGConfig:
         if self.ensemble_method.lower() in {"linear","weighted"}:
             s = sum(self.ranker_weights.values()) or 1.0
             self.ranker_weights = {k: v/s for k, v in self.ranker_weights.items()}
+        assert self.cache_prune_every_writes > 0, "cache_prune_every_writes must be > 0"
+        assert self.cache_eviction_policy.lower() in {"fifo", "lru"}, "cache_eviction_policy must be fifo or lru"
+        self.cache_eviction_policy = self.cache_eviction_policy.lower()
         self.chunk_config = self.get_chunk_config()
         self.chunk_config.validate()
 
@@ -99,7 +110,7 @@ class RAGConfig:
         strategy_dir.mkdir(parents=True, exist_ok=True)
         return strategy_dir
     
-    def get_config_state(self) -> None:
+    def get_config_state(self) -> Dict[str, object]:
         """Returns dict of all config parameters except chunk_config """
         state = self.__dict__.copy()
         state.pop("chunk_config", None) # remove chunk_config to avoid serialization issues
@@ -108,4 +119,14 @@ class RAGConfig:
             if not isinstance(state[key], (int, float, str, bool, list, dict, type(None))):
                 state.pop(key)
         return state
+
+    def get_embedding_cache_config(self) -> Dict[str, object]:
+        return {
+            "cache_dir": self.cache_dir,
+            "ttl_days": self.cache_ttl_days,
+            "max_rows": self.cache_max_rows,
+            "prune_every_writes": self.cache_prune_every_writes,
+            "strict_ttl_on_read": self.cache_strict_ttl_on_read,
+            "eviction_policy": self.cache_eviction_policy,
+        }
         

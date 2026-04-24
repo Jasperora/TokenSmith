@@ -230,7 +230,11 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
     )
 
     retrievers = [
-        FAISSRetriever(faiss_index, cfg.embed_model),
+        FAISSRetriever(
+            faiss_index,
+            cfg.embed_model,
+            cache_config=cfg.get_embedding_cache_config(),
+        ),
         BM25Retriever(bm25_index)
     ]
     

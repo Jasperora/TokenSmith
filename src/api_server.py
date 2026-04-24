@@ -192,7 +192,11 @@ async def lifespan(app: FastAPI):
         }
 
         _retrievers = [
-            FAISSRetriever(faiss_index, _config.embed_model),
+            FAISSRetriever(
+                faiss_index,
+                _config.embed_model,
+                cache_config=_config.get_embedding_cache_config(),
+            ),
             BM25Retriever(bm25_index),
         ]
         

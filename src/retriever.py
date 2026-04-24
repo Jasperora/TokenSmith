@@ -25,13 +25,17 @@ from src.index_builder import preprocess_for_bm25
 
 # -------------------------- Embedder cache ------------------------------
 
-_EMBED_CACHE: Dict[str, CachedEmbedder] = {}
+_EMBED_CACHE: Dict[Tuple[str, Tuple[Tuple[str, Any], ...]], CachedEmbedder] = {}
 
-def _get_embedder(model_name: str) -> CachedEmbedder:
-    if model_name not in _EMBED_CACHE:
+
+def _get_embedder(model_name: str, cache_config: Optional[Dict[str, Any]] = None) -> CachedEmbedder:
+    cache_config = cache_config or {}
+    cache_key = tuple(sorted(cache_config.items()))
+    key = (model_name, cache_key)
+    if key not in _EMBED_CACHE:
         # Use the cached embedding model to avoid reloading it on every call
-        _EMBED_CACHE[model_name] = CachedEmbedder(model_name)
-    return _EMBED_CACHE[model_name]
+        _EMBED_CACHE[key] = CachedEmbedder(model_name, **cache_config)
+    return _EMBED_CACHE[key]
 
 
 # -------------------------- Read artifacts -------------------------------
@@ -89,9 +93,9 @@ class Retriever(ABC):
 class FAISSRetriever(Retriever):
     name = "faiss"
 
-    def __init__(self, index, embed_model: str):
+    def __init__(self, index, embed_model: str, cache_config: Optional[Dict[str, Any]] = None):
         self.index = index
-        self.embedder = _get_embedder(embed_model)
+        self.embedder = _get_embedder(embed_model, cache_config=cache_config)
 
     def get_scores(self,
                 query: str,

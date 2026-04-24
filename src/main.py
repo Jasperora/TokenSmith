@@ -287,7 +287,14 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
         artifacts_dir = cfg.get_artifacts_directory()
         faiss_idx, bm25_idx, chunks, sources, meta = load_artifacts(artifacts_dir, args.index_prefix)
         print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from artifacts.")
-        retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
+        retrievers = [
+            FAISSRetriever(
+                faiss_idx,
+                cfg.embed_model,
+                cache_config=cfg.get_embedding_cache_config(),
+            ),
+            BM25Retriever(bm25_idx),
+        ]
         if cfg.ranker_weights.get("index_keywords", 0) > 0:
             retrievers.append(IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path))
         

@@ -4,19 +4,35 @@ import multiprocessing
 import multiprocessing.pool
 import numpy as np
 from pathlib import Path
-from typing import List, Union, Optional
-from llama_cpp import Llama
+from typing import List, Union, Optional, Literal, Any, TYPE_CHECKING
 from tqdm import tqdm
 
+# Import only for type checkers; runtime import is lazy so cache-only code paths
+# can run without llama.cpp installed.
+if TYPE_CHECKING:
+    from llama_cpp import Llama
+
 # Global variables for worker processes
-_worker_model: Optional[Llama] = None
+_worker_model: Optional[Any] = None
 _worker_embedding_dim: int = 0
+
+
+def _get_llama_class():
+    try:
+        from llama_cpp import Llama as _Llama
+    except ImportError as exc:
+        raise ImportError(
+            "llama_cpp is required for embedding generation. "
+            "Install project dependencies (e.g., `make build`) to enable this feature."
+        ) from exc
+    return _Llama
 
 def _init_worker(model_path: str, n_ctx: int, n_threads: int):
     """
     Initializes the model inside a worker process.
     """
     global _worker_model, _worker_embedding_dim
+    Llama = _get_llama_class()
 
     _worker_model = Llama(
         model_path=model_path,
@@ -63,6 +79,7 @@ class SentenceTransformer:
         """
         self.model_path = model_path
         self.n_ctx = n_ctx
+        Llama = _get_llama_class()
         
         self.model = Llama(
             model_path=model_path,
@@ -212,6 +229,8 @@ class EmbeddingCache:
         ttl_days: Optional[int] = 30,
         max_rows: Optional[int] = 200_000,
         prune_every_writes: int = 500,
+        strict_ttl_on_read: bool = False,
+        eviction_policy: Literal["fifo", "lru"] = "fifo",
     ):
         self.db_path = Path(cache_dir) / "embeddings.db"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -219,6 +238,10 @@ class EmbeddingCache:
         self.ttl_days = ttl_days
         self.max_rows = max_rows
         self.prune_every_writes = max(1, prune_every_writes)
+        self.strict_ttl_on_read = strict_ttl_on_read
+        self.eviction_policy = eviction_policy.lower()
+        if self.eviction_policy not in {"fifo", "lru"}:
+            raise ValueError("eviction_policy must be one of: fifo, lru")
         self._writes_since_prune = 0
 
         self._init_db()
@@ -234,23 +257,49 @@ class EmbeddingCache:
                     query_text TEXT,
                     embedding BLOB,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (model_hash, query_text)
                 )
             """)
+            # Backward-compatible migrations for pre-existing DBs.
+            try:
+                conn.execute("ALTER TABLE embeddings ADD COLUMN last_accessed DATETIME DEFAULT CURRENT_TIMESTAMP")
+            except sqlite3.OperationalError:
+                pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_model_name ON embeddings(model_name)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON embeddings(timestamp)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_last_accessed ON embeddings(last_accessed)")
     
     def get(self, model_path: str, query: str) -> Optional[np.ndarray]:
         """Retrieve cached embedding if it exists."""
         model_hash = hashlib.md5(model_path.encode()).hexdigest()[:16]
         
         with sqlite3.connect(self.db_path) as conn:
-            row = conn.execute(
-                "SELECT embedding FROM embeddings WHERE model_hash=? AND query_text=?",
-                (model_hash, query)
-            ).fetchone()
+            if self.strict_ttl_on_read and self.ttl_days is not None:
+                row = conn.execute(
+                    """
+                    SELECT embedding
+                    FROM embeddings
+                    WHERE model_hash=? AND query_text=?
+                      AND timestamp >= datetime('now', ?)
+                    """,
+                    (model_hash, query, f"-{int(self.ttl_days)} days"),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT embedding FROM embeddings WHERE model_hash=? AND query_text=?",
+                    (model_hash, query),
+                ).fetchone()
             
             if row:
+                conn.execute(
+                    """
+                    UPDATE embeddings
+                    SET last_accessed=CURRENT_TIMESTAMP
+                    WHERE model_hash=? AND query_text=?
+                    """,
+                    (model_hash, query),
+                )
                 return np.frombuffer(row[0], dtype=np.float32)
         return None
 
@@ -262,8 +311,24 @@ class EmbeddingCache:
         
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO embeddings (model_name, model_hash, query_text, embedding) VALUES (?,?,?,?)",
-                (model_name, model_hash, query, blob)
+                """
+                INSERT INTO embeddings (
+                    model_name,
+                    model_hash,
+                    query_text,
+                    embedding,
+                    timestamp,
+                    last_accessed
+                )
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(model_hash, query_text)
+                DO UPDATE SET
+                    model_name=excluded.model_name,
+                    embedding=excluded.embedding,
+                    timestamp=CURRENT_TIMESTAMP,
+                    last_accessed=CURRENT_TIMESTAMP
+                """,
+                (model_name, model_hash, query, blob),
             )
         self._prune_if_needed()
 
@@ -277,13 +342,14 @@ class EmbeddingCache:
                 )
             
             if self.max_rows is not None:
+                order_col = "last_accessed" if self.eviction_policy == "lru" else "timestamp"
                 conn.execute(
-                    """
+                    f"""
                     DELETE FROM embeddings
                     WHERE rowid IN (
                         SELECT rowid
                         FROM embeddings
-                        ORDER BY timestamp DESC
+                        ORDER BY {order_col} DESC
                         LIMIT -1 OFFSET ?
                     )
                     """,
@@ -303,9 +369,26 @@ class CachedEmbedder:
     Drop-in replacement for SentenceTransformer.
     """
     
-    def __init__(self, model_path: str, **kwargs):
+    def __init__(
+        self,
+        model_path: str,
+        cache_dir: str = "index/cache",
+        ttl_days: Optional[int] = 30,
+        max_rows: Optional[int] = 200_000,
+        prune_every_writes: int = 500,
+        strict_ttl_on_read: bool = False,
+        eviction_policy: Literal["fifo", "lru"] = "fifo",
+        **kwargs,
+    ):
         self.embedder = SentenceTransformer(model_path, **kwargs)
-        self.cache = EmbeddingCache()
+        self.cache = EmbeddingCache(
+            cache_dir=cache_dir,
+            ttl_days=ttl_days,
+            max_rows=max_rows,
+            prune_every_writes=prune_every_writes,
+            strict_ttl_on_read=strict_ttl_on_read,
+            eviction_policy=eviction_policy,
+        )
         self.model_path = model_path
     
     def encode(self, texts, **kwargs):
